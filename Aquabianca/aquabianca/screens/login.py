@@ -8,7 +8,7 @@ class LoginMixin:
         frame.pack(fill="both", expand=True)
 
         card = ttk.Frame(frame, style="Card.TFrame", padding=30)
-        card.place(relx=0.5, rely=0.5, anchor="center", width=420, height=320)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=420)
 
         ttk.Label(card, text="Aquabianca POS", style="Header.TLabel").pack(anchor="center", pady=(10, 6))
         ttk.Label(card, text="Local water shop point of sale", style="Sub.TLabel").pack(anchor="center", pady=(0, 24))
