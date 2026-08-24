@@ -3,8 +3,9 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).with_name("aquabianca_pos.db")
+DB_PATH = Path(__file__).resolve().parent.parent / "aquabianca_pos.db"
 DEFAULT_RATE = 89000.0
+DEFAULT_LOW_STOCK_THRESHOLD = 5
 INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
 
 
@@ -95,9 +96,13 @@ class Database:
             );
             """
         )
-        columns = {row["name"] for row in cursor.execute("PRAGMA table_info(sales)").fetchall()}
-        if "customer_no" not in columns:
+        sales_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(sales)").fetchall()}
+        if "customer_no" not in sales_columns:
             cursor.execute("ALTER TABLE sales ADD COLUMN customer_no INTEGER NOT NULL DEFAULT 1")
+
+        user_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
+        if "active" not in user_columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
 
         self.connection.commit()
         self.seed_defaults()
@@ -111,6 +116,14 @@ class Database:
             ON CONFLICT(key) DO NOTHING
             """,
             ("exchange_rate", str(DEFAULT_RATE)),
+        )
+        self._execute(
+            cursor,
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO NOTHING
+            """,
+            ("low_stock_threshold", str(DEFAULT_LOW_STOCK_THRESHOLD)),
         )
 
         default_users = [
@@ -129,17 +142,75 @@ class Database:
 
         self.connection.commit()
 
+    # -- Auth / users -----------------------------------------------------
+
     def authenticate_user(self, username: str, password: str):
         cursor = self.connection.cursor()
         self._execute(
             cursor,
             """
             SELECT * FROM users
-            WHERE username = ? AND password_hash = ?
+            WHERE username = ? AND password_hash = ? AND active = 1
             """,
             (username.strip(), hash_password(password)),
         )
         return cursor.fetchone()
+
+    def get_all_users(self):
+        cursor = self.connection.cursor()
+        self._execute(cursor, "SELECT * FROM users ORDER BY username")
+        return cursor.fetchall()
+
+    def get_user_by_id(self, user_id: int):
+        cursor = self.connection.cursor()
+        self._execute(cursor, "SELECT * FROM users WHERE id = ?", (user_id,))
+        return cursor.fetchone()
+
+    def add_user(self, username: str, full_name: str, role: str, password: str) -> None:
+        cursor = self.connection.cursor()
+        self._execute(
+            cursor,
+            """
+            INSERT INTO users (username, password_hash, role, full_name, active)
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            (username.strip(), hash_password(password), role, full_name.strip()),
+        )
+        self.connection.commit()
+
+    def update_user(self, user_id: int, full_name: str, role: str) -> None:
+        cursor = self.connection.cursor()
+        self._execute(
+            cursor,
+            "UPDATE users SET full_name = ?, role = ? WHERE id = ?",
+            (full_name.strip(), role, user_id),
+        )
+        self.connection.commit()
+
+    def set_user_active(self, user_id: int, active: bool) -> None:
+        cursor = self.connection.cursor()
+        self._execute(cursor, "UPDATE users SET active = ? WHERE id = ?", (1 if active else 0, user_id))
+        self.connection.commit()
+
+    def change_password(self, user_id: int, new_password: str) -> None:
+        cursor = self.connection.cursor()
+        self._execute(
+            cursor,
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(new_password), user_id),
+        )
+        self.connection.commit()
+
+    def verify_password(self, user_id: int, password: str) -> bool:
+        cursor = self.connection.cursor()
+        self._execute(
+            cursor,
+            "SELECT 1 FROM users WHERE id = ? AND password_hash = ?",
+            (user_id, hash_password(password)),
+        )
+        return cursor.fetchone() is not None
+
+    # -- Products -----------------------------------------------------------
 
     def get_active_products(self):
         cursor = self.connection.cursor()
@@ -181,6 +252,8 @@ class Database:
         self._execute(cursor, "DELETE FROM products WHERE id = ?", (product_id,))
         self.connection.commit()
 
+    # -- Settings -------------------------------------------------------------
+
     def get_exchange_rate(self) -> float:
         cursor = self.connection.cursor()
         self._execute(cursor, "SELECT value FROM settings WHERE key = 'exchange_rate'")
@@ -198,6 +271,26 @@ class Database:
             (str(rate),),
         )
         self.connection.commit()
+
+    def get_low_stock_threshold(self) -> int:
+        cursor = self.connection.cursor()
+        self._execute(cursor, "SELECT value FROM settings WHERE key = 'low_stock_threshold'")
+        row = cursor.fetchone()
+        return int(float(row["value"])) if row else DEFAULT_LOW_STOCK_THRESHOLD
+
+    def set_low_stock_threshold(self, threshold: int) -> None:
+        cursor = self.connection.cursor()
+        self._execute(
+            cursor,
+            """
+            INSERT INTO settings (key, value) VALUES ('low_stock_threshold', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(threshold),),
+        )
+        self.connection.commit()
+
+    # -- Cash sessions --------------------------------------------------------
 
     def get_open_session(self, user_id: int):
         cursor = self.connection.cursor()
@@ -280,7 +373,9 @@ class Database:
         )
         self.connection.commit()
 
-    def create_sale(self, session_id: int, user_id: int, customer_no: int, items: list["CartItem"]) -> None:
+    # -- Sales ------------------------------------------------------------------
+
+    def create_sale(self, session_id: int, user_id: int, customer_no: int, items: list) -> None:
         cursor = self.connection.cursor()
         total_lbp = sum(item.total_lbp for item in items)
         total_usd = sum(item.total_usd for item in items)
@@ -367,7 +462,7 @@ class Database:
 
         self._execute(
             cursor,
-            f"""
+            """
             SELECT
                 sales.id,
                 sales.customer_no,
