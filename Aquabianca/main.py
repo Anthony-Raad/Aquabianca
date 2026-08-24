@@ -1,4 +1,4 @@
-from aquabianca_pos import main
+from aquabianca.app import main
 
 
 if __name__ == "__main__":
