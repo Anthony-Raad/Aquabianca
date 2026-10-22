@@ -30,6 +30,18 @@ user's password or add new accounts.
 python main.py
 ```
 
+## Build a Windows .exe (no Python needed on the target PC)
+
+```powershell
+pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name Aquabianca main.py
+```
+
+The exe is written to `dist\Aquabianca.exe`. Put it in a folder together with
+`aquabianca_pos.db` and copy that whole folder to the other PC — when run as an
+exe, the app reads and saves the database next to the `.exe` (a fresh one with
+the default logins is created if none is there).
+
 ## Project layout
 
 ```
