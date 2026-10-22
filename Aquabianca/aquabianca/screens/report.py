@@ -47,6 +47,31 @@ class ReportMixin:
             tk.Label(card, text=title, bg="#ffffff", fg="#35526b", font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(12, 6))
             tk.Label(card, textvariable=self.report_vars[key], bg="#ffffff", fg="#16324f", font=("Segoe UI", 12, "bold"), justify="left").pack(anchor="w", padx=12, pady=(0, 14))
 
+        ttk.Label(container, text="Items Sold per Product", style="Header.TLabel").pack(anchor="w", pady=(10, 8))
+        items_table_wrap = ttk.Frame(container)
+        items_table_wrap.pack(fill="x", pady=(0, 10))
+
+        item_columns = ("product", "qty", "lbp", "usd", "stock")
+        self.report_items_tree = ttk.Treeview(items_table_wrap, columns=item_columns, show="headings", height=8)
+        for col, title, width in [
+            ("product", "Product", 220),
+            ("qty", "Qty Sold", 90),
+            ("lbp", "Total LBP", 130),
+            ("usd", "Total USD", 110),
+            ("stock", "Stock Left", 90),
+        ]:
+            self.report_items_tree.heading(col, text=title)
+            self.report_items_tree.column(col, width=width, anchor="center")
+        self.report_items_tree.column("product", anchor="w")
+        self.report_items_tree.tag_configure("unsold", foreground="#8a9bb0")
+        make_sortable(self.report_items_tree, [
+            ("product", "text"), ("qty", "number"), ("lbp", "number"), ("usd", "number"), ("stock", "number"),
+        ])
+        items_scrollbar = ttk.Scrollbar(items_table_wrap, orient="vertical", command=self.report_items_tree.yview)
+        self.report_items_tree.configure(yscrollcommand=items_scrollbar.set)
+        self.report_items_tree.pack(side="left", fill="x", expand=True)
+        items_scrollbar.pack(side="left", fill="y", padx=(6, 0))
+
         ttk.Label(container, text="Orders", style="Header.TLabel").pack(anchor="w", pady=(10, 8))
         report_table_wrap = ttk.Frame(container)
         report_table_wrap.pack(fill="both", expand=True, pady=(0, 10))
@@ -83,7 +108,7 @@ class ReportMixin:
         self.report_orders_total_var = tk.StringVar(value="Orders Total: 0 LBP | $0.00")
         ttk.Label(container, textvariable=self.report_orders_total_var, style="Sub.TLabel").pack(anchor="e", pady=(0, 8))
 
-        note = "This report shows opening cash, closing cash, items sold, and total sales for the selected day."
+        note = "This report shows opening cash, closing cash, items sold (with per-product quantities), and total sales for the selected day."
         ttk.Label(container, text=note, style="Sub.TLabel").pack(anchor="w")
         self.refresh_report()
 
@@ -132,6 +157,27 @@ class ReportMixin:
 
         self._last_report_rows = order_rows
 
+        item_rows = self.db.get_daily_item_sales(self.report_date_var.get())
+        self._last_report_item_rows = item_rows
+        if hasattr(self, "report_items_tree"):
+            for row in self.report_items_tree.get_children():
+                self.report_items_tree.delete(row)
+            if not item_rows:
+                self.report_items_tree.insert("", "end", values=("No item sales recorded for this date", "-", "-", "-", "-"))
+            for item in item_rows:
+                self.report_items_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item["product_name"],
+                        item["qty_sold"],
+                        format_lbp(item["total_lbp"]),
+                        format_usd(item["total_usd"]),
+                        "-" if item["stock_remaining"] is None else item["stock_remaining"],
+                    ),
+                    tags=(() if item["qty_sold"] else ("unsold",)),
+                )
+
         if hasattr(self, "report_tree"):
             for row in self.report_tree.get_children():
                 self.report_tree.delete(row)
@@ -157,7 +203,8 @@ class ReportMixin:
 
     def export_report_csv(self) -> None:
         rows = getattr(self, "_last_report_rows", [])
-        if not rows:
+        item_rows = getattr(self, "_last_report_item_rows", [])
+        if not rows and not any(item["qty_sold"] > 0 for item in item_rows):
             messagebox.showinfo("Export CSV", "No orders to export for this date.")
             return
 
@@ -184,6 +231,17 @@ class ReportMixin:
                     order["total_lbp"],
                     order["total_usd"],
                     order["items_text"] or "",
+                ])
+            writer.writerow([])
+            writer.writerow(["Items Sold per Product"])
+            writer.writerow(["Product", "Qty Sold", "Total LBP", "Total USD", "Stock Left"])
+            for item in item_rows:
+                writer.writerow([
+                    item["product_name"],
+                    item["qty_sold"],
+                    item["total_lbp"],
+                    item["total_usd"],
+                    "-" if item["stock_remaining"] is None else item["stock_remaining"],
                 ])
         messagebox.showinfo("Exported", f"Report saved to {path}")
 

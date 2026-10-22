@@ -1,9 +1,14 @@
 import hashlib
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "aquabianca_pos.db"
+# When packaged as an .exe, keep the database next to the .exe (not in PyInstaller's temp dir).
+if getattr(sys, "frozen", False):
+    DB_PATH = Path(sys.executable).resolve().parent / "aquabianca_pos.db"
+else:
+    DB_PATH = Path(__file__).resolve().parent.parent / "aquabianca_pos.db"
 DEFAULT_RATE = 89000.0
 DEFAULT_LOW_STOCK_THRESHOLD = 5
 INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
@@ -94,6 +99,19 @@ class Database:
                 FOREIGN KEY(sale_id) REFERENCES sales(id),
                 FOREIGN KEY(product_id) REFERENCES products(id)
             );
+
+            CREATE TABLE IF NOT EXISTS daily_item_sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_date TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL,
+                qty_sold INTEGER NOT NULL DEFAULT 0,
+                total_lbp REAL NOT NULL DEFAULT 0,
+                total_usd REAL NOT NULL DEFAULT 0,
+                stock_remaining INTEGER,
+                updated_at TEXT NOT NULL,
+                UNIQUE(sale_date, product_id)
+            );
             """
         )
         sales_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(sales)").fetchall()}
@@ -106,6 +124,7 @@ class Database:
 
         self.connection.commit()
         self.seed_defaults()
+        self.backfill_daily_item_sales()
 
     def seed_defaults(self) -> None:
         cursor = self.connection.cursor()
@@ -358,6 +377,12 @@ class Database:
             """,
             (datetime.now().isoformat(timespec="seconds"), closing_cash_lbp, closing_cash_usd, session_id),
         )
+        today = datetime.now().date().isoformat()
+        self.refresh_daily_item_sales(today, commit=False)
+        self._execute(cursor, "SELECT DATE(opened_at) AS d FROM cash_sessions WHERE id = ?", (session_id,))
+        opened_row = cursor.fetchone()
+        if opened_row and opened_row["d"] and opened_row["d"] != today:
+            self.refresh_daily_item_sales(opened_row["d"], commit=False)
         self.connection.commit()
 
     def update_session_closing(self, session_id: int, closing_cash_lbp: float, closing_cash_usd: float) -> None:
@@ -418,6 +443,7 @@ class Database:
                 (item.qty, item.product_id),
             )
 
+        self.refresh_daily_item_sales(sold_at[:10], commit=False)
         self.connection.commit()
 
     def get_daily_report(self, date_value: str):
@@ -486,6 +512,9 @@ class Database:
 
     def delete_sale(self, sale_id: int) -> None:
         cursor = self.connection.cursor()
+        self._execute(cursor, "SELECT DATE(sold_at) AS d FROM sales WHERE id = ?", (sale_id,))
+        date_row = cursor.fetchone()
+        sale_date = date_row["d"] if date_row else None
         self._execute(
             cursor,
             """
@@ -506,4 +535,101 @@ class Database:
 
         self._execute(cursor, "DELETE FROM sale_items WHERE sale_id = ?", (sale_id,))
         self._execute(cursor, "DELETE FROM sales WHERE id = ?", (sale_id,))
+        if sale_date:
+            self.refresh_daily_item_sales(sale_date, commit=False)
+        self.connection.commit()
+
+    # -- Daily item sales -------------------------------------------------------
+
+    def refresh_daily_item_sales(self, date_value: str, commit: bool = True) -> None:
+        cursor = self.connection.cursor()
+        self._execute(cursor, "DELETE FROM daily_item_sales WHERE sale_date = ?", (date_value,))
+        now = datetime.now().isoformat(timespec="seconds")
+        # Active products (qty 0 if unsold) plus any existing product sold that day.
+        self._execute(
+            cursor,
+            """
+            INSERT INTO daily_item_sales (
+                sale_date, product_id, product_name, qty_sold, total_lbp, total_usd,
+                stock_remaining, updated_at
+            )
+            SELECT
+                ?,
+                p.id,
+                p.name,
+                COALESCE(s.qty, 0),
+                COALESCE(s.lbp, 0),
+                COALESCE(s.usd, 0),
+                p.stock_qty,
+                ?
+            FROM products p
+            LEFT JOIN (
+                SELECT si.product_id AS product_id,
+                       SUM(si.qty) AS qty,
+                       SUM(si.line_total_lbp) AS lbp,
+                       SUM(si.line_total_usd) AS usd
+                FROM sale_items si
+                INNER JOIN sales sa ON sa.id = si.sale_id
+                WHERE DATE(sa.sold_at) = ?
+                GROUP BY si.product_id
+            ) s ON s.product_id = p.id
+            WHERE p.active = 1 OR s.product_id IS NOT NULL
+            """,
+            (date_value, now, date_value),
+        )
+        # Sold products whose row no longer exists in products at all.
+        self._execute(
+            cursor,
+            """
+            INSERT INTO daily_item_sales (
+                sale_date, product_id, product_name, qty_sold, total_lbp, total_usd,
+                stock_remaining, updated_at
+            )
+            SELECT
+                ?,
+                si.product_id,
+                MAX(si.product_name),
+                SUM(si.qty),
+                SUM(si.line_total_lbp),
+                SUM(si.line_total_usd),
+                NULL,
+                ?
+            FROM sale_items si
+            INNER JOIN sales sa ON sa.id = si.sale_id
+            WHERE DATE(sa.sold_at) = ?
+              AND si.product_id NOT IN (SELECT id FROM products)
+            GROUP BY si.product_id
+            """,
+            (date_value, now, date_value),
+        )
+        if commit:
+            self.connection.commit()
+
+    def get_daily_item_sales(self, date_value: str):
+        # Past days keep their stored snapshot (sales/deletes/close already refresh them);
+        # only today is recomputed so live stock stays current.
+        if date_value == datetime.now().date().isoformat():
+            self.refresh_daily_item_sales(date_value)
+        cursor = self.connection.cursor()
+        self._execute(
+            cursor,
+            """
+            SELECT product_id, product_name, qty_sold, total_lbp, total_usd, stock_remaining
+            FROM daily_item_sales
+            WHERE sale_date = ?
+            ORDER BY qty_sold DESC, product_name
+            """,
+            (date_value,),
+        )
+        return cursor.fetchall()
+
+    def backfill_daily_item_sales(self) -> None:
+        cursor = self.connection.cursor()
+        self._execute(cursor, "SELECT COUNT(*) AS n FROM daily_item_sales")
+        if cursor.fetchone()["n"] > 0:
+            return
+        self._execute(cursor, "SELECT DISTINCT DATE(sold_at) AS d FROM sales WHERE sold_at IS NOT NULL")
+        for row in cursor.fetchall():
+            if row["d"]:
+                self.refresh_daily_item_sales(row["d"], commit=False)
         self.connection.commit()
